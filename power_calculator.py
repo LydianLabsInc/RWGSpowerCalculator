@@ -407,25 +407,25 @@ class PowerCalculatorGUI:
                             font=("Consolas", 9, "bold"))
         co2_label.grid(row=2, column=0, sticky=tk.W, pady=5, padx=5)
         self.co2_flow = tk.StringVar(value="100")
-        co2_entry = tk.Entry(flow_frame, textvariable=self.co2_flow, width=15,
+        self.co2_entry = tk.Entry(flow_frame, textvariable=self.co2_flow, width=15,
                             font=("Consolas", 9))
-        co2_entry.grid(row=2, column=1, sticky=tk.E, pady=5, padx=5)
+        self.co2_entry.grid(row=2, column=1, sticky=tk.E, pady=5, padx=5)
         
         h2_label = tk.Label(flow_frame, text="H₂ (SLPM):", 
                            font=("Consolas", 9, "bold"))
         h2_label.grid(row=3, column=0, sticky=tk.W, pady=5, padx=5)
         self.h2_flow = tk.StringVar(value="100")
-        h2_entry = tk.Entry(flow_frame, textvariable=self.h2_flow, width=15,
+        self.h2_entry = tk.Entry(flow_frame, textvariable=self.h2_flow, width=15,
                            font=("Consolas", 9))
-        h2_entry.grid(row=3, column=1, sticky=tk.E, pady=5, padx=5)
+        self.h2_entry.grid(row=3, column=1, sticky=tk.E, pady=5, padx=5)
         
         n2_label = tk.Label(flow_frame, text="N₂ (SLPM):", 
                           font=("Consolas", 9, "bold"))
         n2_label.grid(row=4, column=0, sticky=tk.W, pady=5, padx=5)
         self.n2_flow = tk.StringVar(value="0")
-        n2_entry = tk.Entry(flow_frame, textvariable=self.n2_flow, width=15,
+        self.n2_entry = tk.Entry(flow_frame, textvariable=self.n2_flow, width=15,
                            font=("Consolas", 9))
-        n2_entry.grid(row=4, column=1, sticky=tk.E, pady=5, padx=5)
+        self.n2_entry.grid(row=4, column=1, sticky=tk.E, pady=5, padx=5)
         
         # CO2 conversion
         conv_frame = ttk.LabelFrame(left_panel, text="", padding="10")
@@ -512,6 +512,16 @@ class PowerCalculatorGUI:
                                 font=("Consolas", 9),
                                 foreground="orange", wraplength=500)
         warning_label.grid(row=3, column=0, columnspan=2, pady=5, padx=5)
+        warning_label.grid_remove()  # Hide initially since it's empty
+        
+        # Trace to show/hide warning label based on content
+        def on_warning_change(*args):
+            if self.warning_result.get().strip():
+                warning_label.grid()
+            else:
+                warning_label.grid_remove()
+        
+        self.warning_result.trace_add("write", on_warning_change)
         
         # Plot controls
         plot_control_frame = ttk.LabelFrame(left_panel, text="", padding="10")
@@ -830,10 +840,18 @@ class PowerCalculatorGUI:
             self.co2_flow.set("0")
             self.h2_flow.set("0")
             self.n2_flow.set("150")
+            # Enable fields for editing
+            self.co2_entry.config(state='normal')
+            self.h2_entry.config(state='normal')
+            self.n2_entry.config(state='normal')
         elif preset == "RWGS":
             self.co2_flow.set("174")
             self.h2_flow.set("400")
             self.n2_flow.set("0")
+            # Enable fields for editing
+            self.co2_entry.config(state='normal')
+            self.h2_entry.config(state='normal')
+            self.n2_entry.config(state='normal')
         elif preset == "Realtime":
             # Fetch from database
             co2_val, h2_val, n2_val = self.fetch_realtime_flow_rates_from_db()
@@ -850,7 +868,15 @@ class PowerCalculatorGUI:
                 self.n2_flow.set(f"{n2_val:.2f}")
             else:
                 self.n2_flow.set("0")
-        # "Manual" - do nothing, user can edit manually
+            # Disable fields - values are read-only from database
+            self.co2_entry.config(state='readonly')
+            self.h2_entry.config(state='readonly')
+            self.n2_entry.config(state='readonly')
+        else:  # "Manual"
+            # Enable fields for manual editing
+            self.co2_entry.config(state='normal')
+            self.h2_entry.config(state='normal')
+            self.n2_entry.config(state='normal')
     
     def fetch_realtime_power_from_db(self):
         """Fetch current realtime power value from database tag ai/ji_308/val"""
