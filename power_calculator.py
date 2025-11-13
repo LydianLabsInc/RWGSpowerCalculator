@@ -14,7 +14,11 @@ import time
 from datetime import datetime, timedelta
 from collections import deque
 import numpy as np
+import warnings
 from databaseHandler import Handler
+
+# Suppress matplotlib tight_layout warnings (harmless but noisy)
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 # Reference state for all enthalpy calculations
 # All gas enthalpies are calculated relative to this state for consistency
@@ -584,6 +588,50 @@ class PowerCalculatorGUI:
         self.custom_range_frame = custom_range_frame
         self.custom_range_frame.grid_remove()  # Initially hidden
         
+        # Y-axis limits section
+        yaxis_frame = ttk.LabelFrame(plot_control_frame, text="Y-Axis Limits (Optional)", padding="5")
+        yaxis_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=5, pady=5)
+        
+        # Power plot y-axis limits
+        power_ylim_label = tk.Label(yaxis_frame, text="Power Plot:", font=("Consolas", 9, "bold"))
+        power_ylim_label.grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        
+        power_ymin_label = tk.Label(yaxis_frame, text="Min (W):", font=("Consolas", 9))
+        power_ymin_label.grid(row=0, column=1, sticky=tk.W, padx=5)
+        self.power_ymin = tk.StringVar(value="")
+        power_ymin_entry = tk.Entry(yaxis_frame, textvariable=self.power_ymin, width=10,
+                                    font=("Consolas", 9))
+        power_ymin_entry.grid(row=0, column=2, sticky=tk.W, padx=5)
+        power_ymin_entry.bind('<KeyRelease>', lambda e: self.update_plot_range())
+        
+        power_ymax_label = tk.Label(yaxis_frame, text="Max (W):", font=("Consolas", 9))
+        power_ymax_label.grid(row=0, column=3, sticky=tk.W, padx=5)
+        self.power_ymax = tk.StringVar(value="")
+        power_ymax_entry = tk.Entry(yaxis_frame, textvariable=self.power_ymax, width=10,
+                                    font=("Consolas", 9))
+        power_ymax_entry.grid(row=0, column=4, sticky=tk.W, padx=5)
+        power_ymax_entry.bind('<KeyRelease>', lambda e: self.update_plot_range())
+        
+        # Temperature plot y-axis limits
+        temp_ylim_label = tk.Label(yaxis_frame, text="Temp Plot:", font=("Consolas", 9, "bold"))
+        temp_ylim_label.grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        
+        temp_ymin_label = tk.Label(yaxis_frame, text="Min (°C):", font=("Consolas", 9))
+        temp_ymin_label.grid(row=1, column=1, sticky=tk.W, padx=5)
+        self.temp_ymin = tk.StringVar(value="")
+        temp_ymin_entry = tk.Entry(yaxis_frame, textvariable=self.temp_ymin, width=10,
+                                   font=("Consolas", 9))
+        temp_ymin_entry.grid(row=1, column=2, sticky=tk.W, padx=5)
+        temp_ymin_entry.bind('<KeyRelease>', lambda e: self.update_plot_range())
+        
+        temp_ymax_label = tk.Label(yaxis_frame, text="Max (°C):", font=("Consolas", 9))
+        temp_ymax_label.grid(row=1, column=3, sticky=tk.W, padx=5)
+        self.temp_ymax = tk.StringVar(value="")
+        temp_ymax_entry = tk.Entry(yaxis_frame, textvariable=self.temp_ymax, width=10,
+                                   font=("Consolas", 9))
+        temp_ymax_entry.grid(row=1, column=4, sticky=tk.W, padx=5)
+        temp_ymax_entry.bind('<KeyRelease>', lambda e: self.update_plot_range())
+        
         # Power plot
         power_plot_frame = ttk.LabelFrame(right_panel, text="Power vs Time", padding="5")
         power_plot_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
@@ -931,7 +979,7 @@ class PowerCalculatorGUI:
             self.update_thread.start()
     
     def live_update_loop(self):
-        """Background thread that updates calculations every second"""
+        """Background thread that updates calculations 4 times per second"""
         while self.live_update_active:
             try:
                 # Fetch temperatures from database
@@ -959,10 +1007,10 @@ class PowerCalculatorGUI:
                     # Calculate power with current settings
                     self.root.after(0, lambda s1=side1_temp, s2=side2_temp, rp=realtime_power: self.calculate_with_temps(s1, s2, rp))
                 
-                time.sleep(1.0)  # Update every second
+                time.sleep(0.25)  # Update 4 times per second (every 0.25 seconds)
             except Exception as e:
                 print(f"Error in live update loop: {e}")
-                time.sleep(1.0)
+                time.sleep(0.25)
     
     def calculate_with_temps(self, side1_temp_val, side2_temp_val, realtime_power=None):
         """Calculate power with given temperature values (used by live updates)"""
@@ -1155,12 +1203,12 @@ class PowerCalculatorGUI:
         
         if power_filtered:
             times, powers, powers_plus25 = zip(*power_filtered)
-            line1 = self.power_ax.plot(times, powers, 'b-', label='Power', linewidth=1.5)[0]
+            line1 = self.power_ax.plot(times, powers, 'b-', label='Power Required', linewidth=1.5)[0]
             line2 = self.power_ax.plot(times, powers_plus25, 'g-', label='+25% Power', linewidth=1.5)[0]
             all_powers.extend(powers)
             all_powers.extend(powers_plus25)
             # Store data for hover
-            self.power_plot_data.append(('Power', list(times), list(powers)))
+            self.power_plot_data.append(('Power Required', list(times), list(powers)))
             self.power_plot_data.append(('+25% Power', list(times), list(powers_plus25)))
         
         if realtime_power_filtered:
@@ -1177,8 +1225,23 @@ class PowerCalculatorGUI:
         self.power_ax.set_ylabel("Power (W)", fontsize=9)
         self.power_ax.grid(True, alpha=0.3)
         self.power_ax.set_xlim(x_min, x_max)
+        # Set y-axis limits (use user input if provided, otherwise auto-scale)
         if all_powers:
-            self.power_ax.set_ylim(min(all_powers) * 0.95, max(all_powers) * 1.05)
+            try:
+                ymin_str = self.power_ymin.get().strip()
+                ymax_str = self.power_ymax.get().strip()
+                if ymin_str and ymax_str:
+                    ymin = float(ymin_str)
+                    ymax = float(ymax_str)
+                    if ymin < ymax:
+                        self.power_ax.set_ylim(ymin, ymax)
+                    else:
+                        self.power_ax.set_ylim(min(all_powers) * 0.95, max(all_powers) * 1.05)
+                else:
+                    self.power_ax.set_ylim(min(all_powers) * 0.95, max(all_powers) * 1.05)
+            except ValueError:
+                # Invalid input, use auto-scale
+                self.power_ax.set_ylim(min(all_powers) * 0.95, max(all_powers) * 1.05)
         self.power_fig.tight_layout()
         self.power_canvas.draw()
         
@@ -1206,9 +1269,24 @@ class PowerCalculatorGUI:
         self.temp_ax.set_ylabel("Temperature (°C)", fontsize=9)
         self.temp_ax.grid(True, alpha=0.3)
         self.temp_ax.set_xlim(x_min, x_max)
+        # Set y-axis limits (use user input if provided, otherwise auto-scale)
         if temp_filtered:
             all_temps = list(side1s) + list(side2s)
-            self.temp_ax.set_ylim(min(all_temps) * 0.95, max(all_temps) * 1.05)
+            try:
+                ymin_str = self.temp_ymin.get().strip()
+                ymax_str = self.temp_ymax.get().strip()
+                if ymin_str and ymax_str:
+                    ymin = float(ymin_str)
+                    ymax = float(ymax_str)
+                    if ymin < ymax:
+                        self.temp_ax.set_ylim(ymin, ymax)
+                    else:
+                        self.temp_ax.set_ylim(min(all_temps) * 0.95, max(all_temps) * 1.05)
+                else:
+                    self.temp_ax.set_ylim(min(all_temps) * 0.95, max(all_temps) * 1.05)
+            except ValueError:
+                # Invalid input, use auto-scale
+                self.temp_ax.set_ylim(min(all_temps) * 0.95, max(all_temps) * 1.05)
         self.temp_fig.tight_layout()
         self.temp_canvas.draw()
     
