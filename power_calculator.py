@@ -778,7 +778,8 @@ class PowerCalculatorGUI:
             start_time = end_time - timedelta(minutes=2)
             
             # Fetch Side 1 temperatures
-            side1_temp = None
+            side1_tag1_val = None
+            side1_tag2_val = None
             if side1_tag1_id:
                 tagids = [side1_tag1_id]
                 if side1_tag2_id:
@@ -786,24 +787,18 @@ class PowerCalculatorGUI:
                 
                 df = self.db_handler.getDataframeBetween(start_time, end_time, tagids)
                 if df is not None and not df.empty:
-                    # Get most recent non-null values
+                    tag1_name = side1_tag1_full
+                    if tag1_name in df.columns:
+                        side1_tag1_val = df[tag1_name].dropna().iloc[-1] if not df[tag1_name].dropna().empty else None
+                    
                     if side1_tag2_id:
-                        # Average two tags
-                        tag1_name = side1_tag1_full
                         tag2_name = side1_tag2_full
-                        if tag1_name in df.columns and tag2_name in df.columns:
-                            df['avg_side1'] = df[[tag1_name, tag2_name]].mean(axis=1)
-                            side1_temp = df['avg_side1'].dropna().iloc[-1] if not df['avg_side1'].dropna().empty else None
-                        elif tag1_name in df.columns:
-                            side1_temp = df[tag1_name].dropna().iloc[-1] if not df[tag1_name].dropna().empty else None
-                    else:
-                        # Single tag
-                        tag1_name = side1_tag1_full
-                        if tag1_name in df.columns:
-                            side1_temp = df[tag1_name].dropna().iloc[-1] if not df[tag1_name].dropna().empty else None
+                        if tag2_name in df.columns:
+                            side1_tag2_val = df[tag2_name].dropna().iloc[-1] if not df[tag2_name].dropna().empty else None
             
             # Fetch Side 2 temperatures
-            side2_temp = None
+            side2_tag1_val = None
+            side2_tag2_val = None
             if side2_tag1_id:
                 tagids = [side2_tag1_id]
                 if side2_tag2_id:
@@ -811,21 +806,44 @@ class PowerCalculatorGUI:
                 
                 df = self.db_handler.getDataframeBetween(start_time, end_time, tagids)
                 if df is not None and not df.empty:
-                    # Get most recent non-null values
+                    tag1_name = side2_tag1_full
+                    if tag1_name in df.columns:
+                        side2_tag1_val = df[tag1_name].dropna().iloc[-1] if not df[tag1_name].dropna().empty else None
+                    
                     if side2_tag2_id:
-                        # Average two tags
-                        tag1_name = side2_tag1_full
                         tag2_name = side2_tag2_full
-                        if tag1_name in df.columns and tag2_name in df.columns:
-                            df['avg_side2'] = df[[tag1_name, tag2_name]].mean(axis=1)
-                            side2_temp = df['avg_side2'].dropna().iloc[-1] if not df['avg_side2'].dropna().empty else None
-                        elif tag1_name in df.columns:
-                            side2_temp = df[tag1_name].dropna().iloc[-1] if not df[tag1_name].dropna().empty else None
+                        if tag2_name in df.columns:
+                            side2_tag2_val = df[tag2_name].dropna().iloc[-1] if not df[tag2_name].dropna().empty else None
+            
+            # Calculate side temperatures based on the new logic:
+            # Use max of whichever pair is higher on average, and min of whichever pair is lower on average
+            side1_temp = None
+            side2_temp = None
+            
+            # Get individual values (handle None cases)
+            side1_vals = [v for v in [side1_tag1_val, side1_tag2_val] if v is not None]
+            side2_vals = [v for v in [side2_tag1_val, side2_tag2_val] if v is not None]
+            
+            if side1_vals and side2_vals:
+                # Calculate averages
+                side1_avg = sum(side1_vals) / len(side1_vals) if side1_vals else None
+                side2_avg = sum(side2_vals) / len(side2_vals) if side2_vals else None
+                
+                if side1_avg is not None and side2_avg is not None:
+                    if side1_avg >= side2_avg:
+                        # Side 1 is higher on average: use max for side1, min for side2
+                        side1_temp = max(side1_vals)
+                        side2_temp = min(side2_vals)
                     else:
-                        # Single tag
-                        tag1_name = side2_tag1_full
-                        if tag1_name in df.columns:
-                            side2_temp = df[tag1_name].dropna().iloc[-1] if not df[tag1_name].dropna().empty else None
+                        # Side 2 is higher on average: use min for side1, max for side2
+                        side1_temp = min(side1_vals)
+                        side2_temp = max(side2_vals)
+            elif side1_vals:
+                # Only side1 has values - use the value(s) directly
+                side1_temp = side1_vals[0] if len(side1_vals) == 1 else max(side1_vals)
+            elif side2_vals:
+                # Only side2 has values - use the value(s) directly
+                side2_temp = side2_vals[0] if len(side2_vals) == 1 else max(side2_vals)
             
             return side1_temp, side2_temp
         except Exception as e:
