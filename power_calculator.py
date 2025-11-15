@@ -282,9 +282,13 @@ class PowerCalculatorGUI:
             self.db_available = False
         
         # Data storage for plotting (unlimited history, 1 point per second)
-        self.power_history = deque()  # [(datetime, power, power_plus_25), ...]
+        # power_history: (datetime, base_power_without_heat_loss, total_power, power_plus_25)
+        self.power_history = deque()  
         self.temp_history = deque()   # [(datetime, side1_temp, side2_temp), ...]
         self.realtime_power_history = deque()  # [(datetime, realtime_power), ...]
+        self.co2_flow_history = deque()  # [(datetime, co2_lpm), ...] for flow conversion tab
+        self.n2_flow_history = deque()  # [(datetime, n2_lpm), ...] for flow conversion tab
+        self.h2_flow_history = deque()  # [(datetime, h2_lpm), ...] for flow conversion tab
         
         # Live update control
         self.live_update_active = False
@@ -295,8 +299,28 @@ class PowerCalculatorGUI:
     
     def create_widgets(self):
         """Create GUI widgets"""
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Tab 1: Power Calculator
+        power_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(power_tab, text="Power Calculator")
+        
+        # Tab 2: Flow Rate Conversion
+        conversion_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(conversion_tab, text="Flow Rate Conversion")
+        
+        # Create power calculator widgets in first tab
+        self.create_power_calculator_tab(power_tab)
+        
+        # Create flow rate conversion widgets in second tab
+        self.create_flow_conversion_tab(conversion_tab)
+    
+    def create_power_calculator_tab(self, parent):
+        """Create widgets for the power calculator tab"""
         # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(parent)
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Title
@@ -463,6 +487,8 @@ class PowerCalculatorGUI:
                                  font=("Consolas", 9, "bold"))
         heatloss_label.grid(row=1, column=0, sticky=tk.W, pady=5, padx=5)
         self.heat_loss = tk.StringVar(value="0")
+        # Add trace to recalculate historical values when heat loss changes
+        self.heat_loss.trace_add("write", lambda *args: self.recalculate_power_history())
         heatloss_entry = tk.Entry(heatloss_frame, textvariable=self.heat_loss, width=15,
                                   font=("Consolas", 9))
         heatloss_entry.grid(row=1, column=1, sticky=tk.E, pady=5, padx=5)
@@ -685,6 +711,8 @@ class PowerCalculatorGUI:
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=0)  # Left panel - fixed width
         main_frame.columnconfigure(1, weight=1)  # Right panel - expands
         main_frame.rowconfigure(1, weight=1)
@@ -857,7 +885,7 @@ class PowerCalculatorGUI:
         
         try:
             # Get tag IDs
-            co2_tag_id = self.get_tag_id_from_name("ai/fi_116m/val")
+            co2_tag_id = self.get_tag_id_from_name("ai/fi_116/val")
             h2_tag_id = self.get_tag_id_from_name("ai/fi_106m/val")
             n2_tag_id = self.get_tag_id_from_name("ai/fi_126m/val")
             
@@ -873,7 +901,7 @@ class PowerCalculatorGUI:
             if co2_tag_id:
                 df = self.db_handler.getDataframeBetween(start_time, end_time, [co2_tag_id])
                 if df is not None and not df.empty:
-                    tag_name = "ai/fi_116m/val"
+                    tag_name = "ai/fi_116/val"
                     if tag_name in df.columns:
                         co2_value = df[tag_name].dropna().iloc[-1] if not df[tag_name].dropna().empty else None
             
@@ -1025,6 +1053,17 @@ class PowerCalculatorGUI:
                     # Calculate power with current settings
                     self.root.after(0, lambda s1=side1_temp, s2=side2_temp, rp=realtime_power: self.calculate_with_temps(s1, s2, rp))
                 
+                # Update flow plot and temp/pressure if we're on the conversion tab
+                try:
+                    current_tab = self.notebook.index(self.notebook.select())
+                    if current_tab == 1:  # Flow conversion tab is index 1
+                        self.root.after(0, self.update_flow_plot)
+                        # Also update temperature and pressure values in conversion tab
+                        if self.use_db_conv.get():
+                            self.root.after(0, self.update_conv_temp_pressure)
+                except:
+                    pass
+                
                 time.sleep(0.25)  # Update 4 times per second (every 0.25 seconds)
             except Exception as e:
                 print(f"Error in live update loop: {e}")
@@ -1057,10 +1096,11 @@ class PowerCalculatorGUI:
             # Calculate +25% power
             power_plus_25 = total_power * 1.25
             
-            # Store data point (store side temps, not calculated inlet/outlet)
+            # Store data point (store base power without heat loss so we can recalculate)
             now = datetime.now()
             with self.update_lock:
-                self.power_history.append((now, total_power, power_plus_25))
+                # Store: (datetime, base_power_without_heat_loss, total_power, power_plus_25)
+                self.power_history.append((now, power, total_power, power_plus_25))
                 self.temp_history.append((now, side1_temp_val, side2_temp_val))
                 
                 # Store realtime power if available (convert from kW to W)
@@ -1101,13 +1141,49 @@ class PowerCalculatorGUI:
         """Update plot x-axis range based on user selection"""
         self.update_plots()
     
+    def recalculate_power_history(self):
+        """Recalculate all historical power values when heat loss changes"""
+        try:
+            heat_loss = float(self.heat_loss.get())
+            with self.update_lock:
+                # Recalculate all power values with new heat loss
+                recalculated = []
+                for dt, base_power, _, _ in self.power_history:
+                    total_power = base_power + heat_loss
+                    power_plus_25 = total_power * 1.25
+                    recalculated.append((dt, base_power, total_power, power_plus_25))
+                # Replace history
+                self.power_history.clear()
+                self.power_history.extend(recalculated)
+            # Update plots and display
+            self.root.after(0, self.update_plots)
+            # Update current display if we have recent data
+            if self.power_history:
+                _, _, total_power, power_plus_25 = self.power_history[-1]
+                if total_power >= 1000:
+                    power_kw = total_power / 1000
+                    self.power_result.set(f"{power_kw:.2f} kW ({total_power:.1f} W)")
+                else:
+                    self.power_result.set(f"{total_power:.1f} W")
+                
+                if power_plus_25 >= 1000:
+                    power_plus25_kw = power_plus_25 / 1000
+                    self.power_plus25_result.set(f"{power_plus25_kw:.2f} kW ({power_plus_25:.1f} W)")
+                else:
+                    self.power_plus25_result.set(f"{power_plus_25:.1f} W")
+        except ValueError:
+            # Invalid heat loss value, ignore
+            pass
+        except Exception as e:
+            print(f"Error recalculating power history: {e}")
+    
     def update_plots(self):
         """Update both power and temperature plots"""
         with self.update_lock:
             # Get data (create copies to avoid holding lock during plotting)
-            power_times = [t for t, _, _ in self.power_history]
-            power_values = [p for _, p, _ in self.power_history]
-            power_plus25_values = [p25 for _, _, p25 in self.power_history]
+            power_times = [t for t, _, _, _ in self.power_history]
+            power_values = [p for _, _, p, _ in self.power_history]
+            power_plus25_values = [p25 for _, _, _, p25 in self.power_history]
             temp_times = [t for t, _, _ in self.temp_history]
             side1_temps = [t1 for _, t1, _ in self.temp_history]
             side2_temps = [t2 for _, _, t2 in self.temp_history]
@@ -1410,6 +1486,623 @@ class PowerCalculatorGUI:
         
         self.temp_canvas.draw_idle()
     
+    def create_flow_conversion_tab(self, parent):
+        """Create widgets for the flow rate conversion tab"""
+        # Title
+        title_label = tk.Label(parent, text="Flow Rate Conversion", 
+                              font=("Consolas", 16, "bold"))
+        title_label.grid(row=0, column=0, pady=15)
+        
+        # Main content frame
+        content_frame = ttk.Frame(parent, padding="10")
+        content_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.columnconfigure(1, weight=1)
+        
+        # Gas selection buttons
+        gas_frame = ttk.LabelFrame(content_frame, text="Select Gas", padding="10")
+        gas_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=10, pady=10)
+        
+        self.selected_gas = tk.StringVar(value="CO2")
+        co2_radio = tk.Radiobutton(gas_frame, text="CO₂", variable=self.selected_gas, value="CO2",
+                                   font=("Consolas", 9), command=self.switch_gas)
+        co2_radio.grid(row=0, column=0, padx=10, pady=5)
+        
+        n2_radio = tk.Radiobutton(gas_frame, text="N₂", variable=self.selected_gas, value="N2",
+                                  font=("Consolas", 9), command=self.switch_gas)
+        n2_radio.grid(row=0, column=1, padx=10, pady=5)
+        
+        h2_radio = tk.Radiobutton(gas_frame, text="H₂", variable=self.selected_gas, value="H2",
+                                  font=("Consolas", 9), command=self.switch_gas)
+        h2_radio.grid(row=0, column=2, padx=10, pady=5)
+        
+        # Input section
+        input_frame = ttk.LabelFrame(content_frame, text="Input", padding="10")
+        input_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), padx=10, pady=10)
+        
+        slpm_label = tk.Label(input_frame, text="SLPM (at STP: 0°C, 0 bar gauge):", 
+                              font=("Consolas", 10, "bold"))
+        slpm_label.grid(row=0, column=0, sticky=tk.W, pady=5, padx=5)
+        
+        self.slpm_input = tk.StringVar(value="100")
+        slpm_entry = tk.Entry(input_frame, textvariable=self.slpm_input, width=15,
+                             font=("Consolas", 9))
+        slpm_entry.grid(row=0, column=1, sticky=tk.E, pady=5, padx=5)
+        
+        calc_button = ttk.Button(input_frame, text="Calculate", command=self.calculate_flow_conversion)
+        calc_button.grid(row=1, column=0, columnspan=2, pady=10)
+        
+        # Output section
+        output_frame = ttk.LabelFrame(content_frame, text="Output", padding="10")
+        output_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=10, pady=10)
+        
+        lpm_label = tk.Label(output_frame, text="LPM at Actual Conditions:", 
+                            font=("Consolas", 10, "bold"))
+        lpm_label.grid(row=0, column=0, sticky=tk.W, pady=5, padx=5)
+        
+        self.lpm_output = tk.StringVar(value="---")
+        lpm_display = tk.Label(output_frame, textvariable=self.lpm_output, 
+                              font=("Consolas", 12, "bold"), foreground="blue")
+        lpm_display.grid(row=0, column=1, sticky=tk.W, pady=5, padx=5)
+        
+        # Temperature and Pressure section
+        cond_frame = ttk.LabelFrame(content_frame, text="Conditions", padding="10")
+        cond_frame.grid(row=1, column=1, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
+        cond_frame.grid_columnconfigure(0, weight=1)
+        cond_frame.grid_columnconfigure(1, weight=1)
+        
+        # Realtime checkbox (controls both temperature and pressure)
+        self.use_db_conv = tk.BooleanVar(value=True)
+        realtime_check = tk.Checkbutton(cond_frame, text="Realtime",
+                                        variable=self.use_db_conv,
+                                        font=("Consolas", 9),
+                                        command=self.toggle_conv_db_mode)
+        realtime_check.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=5, padx=5)
+        
+        # Temperature
+        temp_title = tk.Label(cond_frame, text="Temperature", font=("Consolas", 10, "bold"))
+        temp_title.grid(row=1, column=0, columnspan=2, pady=(10, 10))
+        
+        temp_manual_label = tk.Label(cond_frame, text="Temperature (°C):", 
+                                     font=("Consolas", 9, "bold"))
+        temp_manual_label.grid(row=2, column=0, sticky=tk.W, pady=5, padx=5)
+        self.temp_manual = tk.StringVar(value="20")
+        self.temp_manual_entry = tk.Entry(cond_frame, textvariable=self.temp_manual, width=15,
+                                          font=("Consolas", 9), state='disabled')
+        self.temp_manual_entry.grid(row=2, column=1, sticky=tk.E, pady=5, padx=5)
+        
+        self.temp_db_tag_label = tk.Label(cond_frame, text="Tag: ai/ti_116/val", 
+                                    font=("Consolas", 8), foreground="gray")
+        self.temp_db_tag_label.grid(row=3, column=0, sticky=tk.W, pady=2, padx=5)
+        
+        self.temp_db_value = tk.StringVar(value="---")
+        temp_db_display = tk.Label(cond_frame, textvariable=self.temp_db_value, 
+                                   font=("Consolas", 9), foreground="blue")
+        temp_db_display.grid(row=3, column=1, sticky=tk.W, pady=2, padx=5)
+        
+        self.temp_age_label = tk.Label(cond_frame, text="", 
+                                        font=("Consolas", 7), foreground="gray")
+        self.temp_age_label.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=0, padx=5)
+        
+        # Pressure
+        pressure_title = tk.Label(cond_frame, text="Pressure", font=("Consolas", 10, "bold"))
+        pressure_title.grid(row=5, column=0, columnspan=2, pady=(10, 10))
+        
+        pressure_manual_label = tk.Label(cond_frame, text="Pressure (bar gauge):", 
+                                         font=("Consolas", 9, "bold"))
+        pressure_manual_label.grid(row=6, column=0, sticky=tk.W, pady=5, padx=5)
+        self.pressure_manual = tk.StringVar(value="0")
+        self.pressure_manual_entry = tk.Entry(cond_frame, textvariable=self.pressure_manual, width=15,
+                                             font=("Consolas", 9), state='disabled')
+        self.pressure_manual_entry.grid(row=6, column=1, sticky=tk.E, pady=5, padx=5)
+        
+        self.pressure_db_tag_label = tk.Label(cond_frame, text="Tag: ai/pi_116/val (bar gauge)", 
+                                        font=("Consolas", 8), foreground="gray")
+        self.pressure_db_tag_label.grid(row=7, column=0, sticky=tk.W, pady=2, padx=5)
+        
+        self.pressure_db_value = tk.StringVar(value="---")
+        pressure_db_display = tk.Label(cond_frame, textvariable=self.pressure_db_value, 
+                                       font=("Consolas", 9), foreground="blue")
+        pressure_db_display.grid(row=7, column=1, sticky=tk.W, pady=2, padx=5)
+        
+        self.pressure_age_label = tk.Label(cond_frame, text="", 
+                                            font=("Consolas", 7), foreground="gray")
+        self.pressure_age_label.grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=0, padx=5)
+        
+        # Flow Rate Plot Controls
+        plot_control_frame = ttk.LabelFrame(content_frame, text="Plot Controls", padding="5")
+        plot_control_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=10, pady=5)
+        
+        # Radio buttons for time range selection
+        self.flow_time_range_mode = tk.StringVar(value="last")
+        flow_last_radio = tk.Radiobutton(plot_control_frame, text="Last", 
+                                         variable=self.flow_time_range_mode, value="last",
+                                         font=("Consolas", 9), command=self.update_flow_plot)
+        flow_last_radio.grid(row=0, column=0, sticky=tk.W, padx=5)
+        
+        self.flow_time_value = tk.StringVar(value="5")
+        flow_time_value_entry = tk.Entry(plot_control_frame, textvariable=self.flow_time_value, width=10,
+                                         font=("Consolas", 9))
+        flow_time_value_entry.grid(row=0, column=1, sticky=tk.W, padx=5)
+        flow_time_value_entry.bind('<KeyRelease>', lambda e: self.update_flow_plot())
+        
+        self.flow_time_unit = tk.StringVar(value="minutes")
+        flow_time_unit_menu = ttk.Combobox(plot_control_frame, textvariable=self.flow_time_unit, 
+                                          values=["seconds", "minutes", "hours"], width=10,
+                                          state="readonly", font=("Consolas", 9))
+        flow_time_unit_menu.grid(row=0, column=2, sticky=tk.W, padx=5)
+        flow_time_unit_menu.bind("<<ComboboxSelected>>", lambda e: self.update_flow_plot())
+        
+        # Flow Rate Plot
+        self.plot_frame = ttk.LabelFrame(content_frame, text="Flow Rate vs Time", padding="5")
+        self.plot_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
+        self.plot_frame.grid_columnconfigure(0, weight=1)
+        self.plot_frame.grid_rowconfigure(0, weight=1)
+        
+        self.flow_fig = Figure(figsize=(10, 4), dpi=100)
+        self.flow_ax = self.flow_fig.add_subplot(111)
+        self.flow_ax.set_xlabel("Time", fontsize=9)
+        self.flow_ax.set_ylabel("Flow Rate (LPM)", fontsize=9)
+        self.flow_ax.grid(True, alpha=0.3)
+        self.flow_canvas = FigureCanvasTkAgg(self.flow_fig, self.plot_frame)
+        self.flow_canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.columnconfigure(1, weight=1)
+        content_frame.rowconfigure(4, weight=1)
+    
+    def get_gas_tags(self, gas):
+        """Get temperature, pressure, and flow rate tags for the selected gas
+        Returns: (temp_tag_name, pressure_tag_name, flow_tag_id, gas_name)
+        Note: flow_tag_id is the actual tag ID number, not the tag name"""
+        if gas == "CO2":
+            return ("ai/ti_116/val", "ai/pi_116/val", None, "CO₂")  # flow_tag_id will be set by get_gas_flow_tag_id
+        elif gas == "N2":
+            return ("ai/ti_126/val", "ai/pi_126/val", None, "N₂")
+        elif gas == "H2":
+            return ("ai/ti_106/val", "ai/pi_106/val", None, "H₂")
+        else:
+            return ("ai/ti_116/val", "ai/pi_116/val", None, "CO₂")
+    
+    def get_gas_flow_tag_id(self, gas):
+        """Get the flow rate tag ID for the selected gas"""
+        if gas == "CO2":
+            return 299  # Tag ID 299 for CO2
+        elif gas == "N2":
+            return None  # N2 flow rate not available
+        elif gas == "H2":
+            return 298  # Tag ID 298 for hydrogen
+        else:
+            return None
+    
+    def switch_gas(self):
+        """Update UI and plot when gas selection changes"""
+        gas = self.selected_gas.get()
+        temp_tag, pressure_tag, _, gas_name = self.get_gas_tags(gas)
+        flow_tag_id = self.get_gas_flow_tag_id(gas)
+        
+        # Update tag labels
+        self.temp_db_tag_label.config(text=f"Tag: {temp_tag}")
+        self.pressure_db_tag_label.config(text=f"Tag: {pressure_tag} (bar gauge)")
+        if flow_tag_id is not None:
+            self.plot_frame.config(text=f"{gas_name} Flow Rate vs Time (Tag ID: {flow_tag_id})")
+        else:
+            self.plot_frame.config(text=f"{gas_name} Flow Rate vs Time")
+        
+        # If Realtime is enabled, update conditions and output
+        if self.use_db_conv.get():
+            self.toggle_conv_db_mode()  # This will fetch and update the values
+            # Also update the output if we have SLPM input
+            try:
+                slpm = float(self.slpm_input.get())
+                if slpm > 0:
+                    self.calculate_flow_conversion()
+            except:
+                pass
+        
+        # Update plot
+        self.update_flow_plot()
+    
+    def update_conv_temp_pressure(self):
+        """Update temperature and pressure values from database (called by live update loop)"""
+        if self.use_db_conv.get() and self.db_available:
+            temp_c, temp_age, pressure_bar_gauge, pressure_age = self.fetch_temp_pressure_from_db()
+            if temp_c is not None:
+                if temp_age is not None and temp_age.total_seconds() > 60:  # Show age if > 1 minute
+                    age_str = self.format_age(temp_age)
+                    self.temp_db_value.set(f"{temp_c:.2f} °C")
+                    self.temp_age_label.config(text=f"(Age: {age_str})")
+                else:
+                    self.temp_db_value.set(f"{temp_c:.2f} °C")
+                    self.temp_age_label.config(text="")
+            else:
+                self.temp_db_value.set("---")
+                self.temp_age_label.config(text="")
+            if pressure_bar_gauge is not None:
+                if pressure_age is not None and pressure_age.total_seconds() > 60:  # Show age if > 1 minute
+                    age_str = self.format_age(pressure_age)
+                    self.pressure_db_value.set(f"{pressure_bar_gauge:.2f} bar gauge")
+                    self.pressure_age_label.config(text=f"(Age: {age_str})")
+                else:
+                    self.pressure_db_value.set(f"{pressure_bar_gauge:.2f} bar gauge")
+                    self.pressure_age_label.config(text="")
+            else:
+                self.pressure_db_value.set("---")
+                self.pressure_age_label.config(text="")
+    
+    def toggle_conv_db_mode(self):
+        """Enable/disable manual entry fields for temperature and pressure in conversion tab"""
+        if self.use_db_conv.get():
+            self.temp_manual_entry.config(state='disabled')
+            self.pressure_manual_entry.config(state='disabled')
+            # Update display with database value
+            self.update_conv_temp_pressure()
+        else:
+            self.temp_manual_entry.config(state='normal')
+            self.pressure_manual_entry.config(state='normal')
+            self.temp_db_value.set("---")
+            self.pressure_db_value.set("---")
+            self.temp_age_label.config(text="")
+            self.pressure_age_label.config(text="")
+    
+    def format_age(self, age_delta):
+        """Format a timedelta as a human-readable age string"""
+        total_seconds = int(age_delta.total_seconds())
+        if total_seconds < 60:
+            return f"{total_seconds}s"
+        elif total_seconds < 3600:
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            return f"{minutes}m {seconds}s"
+        else:
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            return f"{hours}h {minutes}m"
+    
+    def fetch_temp_pressure_from_db(self):
+        """Fetch temperature and pressure from database for flow conversion
+        Returns: (temp_value, temp_age, pressure_value, pressure_age)
+        If no value at current time, uses most recent value and returns its age"""
+        if not self.db_available:
+            return None, None, None, None
+        
+        try:
+            # Get tags for selected gas
+            gas = self.selected_gas.get()
+            temp_tag, pressure_tag, _, _ = self.get_gas_tags(gas)
+            
+            # Get tag IDs
+            temp_tag_id = self.get_tag_id_from_name(temp_tag)
+            pressure_tag_id = self.get_tag_id_from_name(pressure_tag)
+            
+            # Get recent data (last hour to find most recent value)
+            end_time = datetime.now()
+            start_time = end_time - timedelta(hours=1)
+            
+            temp_value = None
+            temp_age = None
+            pressure_value = None
+            pressure_age = None
+            
+            # Fetch temperature
+            if temp_tag_id:
+                df = self.db_handler.getDataframeBetween(start_time, end_time, [temp_tag_id])
+                if df is not None and not df.empty:
+                    if temp_tag in df.columns:
+                        # Get non-null values
+                        temp_series = df[temp_tag].dropna()
+                        if not temp_series.empty:
+                            temp_value = temp_series.iloc[-1]
+                            # Get timestamp of this value
+                            if 'datetime' in df.columns:
+                                temp_timestamp = df.loc[temp_series.index[-1], 'datetime']
+                                try:
+                                    from pandas import Timestamp
+                                    if isinstance(temp_timestamp, Timestamp):
+                                        temp_timestamp = temp_timestamp.to_pydatetime()
+                                except:
+                                    pass
+                                if hasattr(temp_timestamp, 'to_pydatetime'):
+                                    temp_timestamp = temp_timestamp.to_pydatetime()
+                                temp_age = end_time - temp_timestamp
+            
+            # Fetch pressure
+            if pressure_tag_id:
+                df = self.db_handler.getDataframeBetween(start_time, end_time, [pressure_tag_id])
+                if df is not None and not df.empty:
+                    if pressure_tag in df.columns:
+                        # Get non-null values
+                        pressure_series = df[pressure_tag].dropna()
+                        if not pressure_series.empty:
+                            pressure_value = pressure_series.iloc[-1]
+                            # Get timestamp of this value
+                            if 'datetime' in df.columns:
+                                pressure_timestamp = df.loc[pressure_series.index[-1], 'datetime']
+                                try:
+                                    from pandas import Timestamp
+                                    if isinstance(pressure_timestamp, Timestamp):
+                                        pressure_timestamp = pressure_timestamp.to_pydatetime()
+                                except:
+                                    pass
+                                if hasattr(pressure_timestamp, 'to_pydatetime'):
+                                    pressure_timestamp = pressure_timestamp.to_pydatetime()
+                                pressure_age = end_time - pressure_timestamp
+            
+            return temp_value, temp_age, pressure_value, pressure_age
+        except Exception as e:
+            print(f"Error fetching temperature/pressure from database: {e}")
+            return None, None, None, None
+    
+    def calculate_flow_conversion(self):
+        """Calculate LPM at actual conditions from SLPM"""
+        try:
+            # Get SLPM input
+            slpm = float(self.slpm_input.get())
+            
+            # Get temperature (from database or manual)
+            if self.use_db_conv.get() and self.db_available:
+                temp_c, temp_age, _, _ = self.fetch_temp_pressure_from_db()
+                if temp_c is None:
+                    self.lpm_output.set("Error: Could not fetch temperature from database")
+                    return
+                if temp_age is not None and temp_age.total_seconds() > 60:
+                    age_str = self.format_age(temp_age)
+                    self.temp_db_value.set(f"{temp_c:.2f} °C")
+                    self.temp_age_label.config(text=f"(Age: {age_str})")
+                else:
+                    self.temp_db_value.set(f"{temp_c:.2f} °C")
+                    self.temp_age_label.config(text="")
+            else:
+                temp_c = float(self.temp_manual.get())
+                self.temp_db_value.set("---")
+                self.temp_age_label.config(text="")
+            
+            # Get pressure (from database or manual)
+            if self.use_db_conv.get() and self.db_available:
+                _, _, pressure_bar_gauge, pressure_age = self.fetch_temp_pressure_from_db()
+                if pressure_bar_gauge is None:
+                    self.lpm_output.set("Error: Could not fetch pressure from database")
+                    return
+                if pressure_age is not None and pressure_age.total_seconds() > 60:
+                    age_str = self.format_age(pressure_age)
+                    self.pressure_db_value.set(f"{pressure_bar_gauge:.2f} bar gauge")
+                    self.pressure_age_label.config(text=f"(Age: {age_str})")
+                else:
+                    self.pressure_db_value.set(f"{pressure_bar_gauge:.2f} bar gauge")
+                    self.pressure_age_label.config(text="")
+            else:
+                pressure_bar_gauge = float(self.pressure_manual.get())
+                self.pressure_db_value.set("---")
+                self.pressure_age_label.config(text="")
+            
+            # STP conditions: 0°C, 0 bar gauge
+            T_STP_K = 0.0 + 273.15  # 273.15 K
+            P_STP_bar_abs = 1.01325  # 1 atm = 1.01325 bar absolute (0 bar gauge)
+            
+            # Actual conditions
+            T_actual_K = temp_c + 273.15
+            P_actual_bar_abs = pressure_bar_gauge + 1.01325  # Convert gauge to absolute
+            
+            # Ideal gas law: V_actual = V_STP * (P_STP / P_actual) * (T_actual / T_STP)
+            lpm_actual = slpm * (P_STP_bar_abs / P_actual_bar_abs) * (T_actual_K / T_STP_K)
+            
+            self.lpm_output.set(f"{lpm_actual:.2f} LPM")
+            
+        except ValueError:
+            self.lpm_output.set("Error: Invalid SLPM input")
+        except Exception as e:
+            self.lpm_output.set(f"Error: {str(e)}")
+    
+    def convert_gas_from_db(self):
+        """Convert selected gas from database LPM to SLPM"""
+        try:
+            # Get tags for selected gas
+            gas = self.selected_gas.get()
+            temp_tag, pressure_tag, flow_tag, gas_name = self.get_gas_tags(gas)
+            
+            # Fetch gas LPM from database
+            flow_tag_id = self.get_tag_id_from_name(flow_tag)
+            if flow_tag_id is None:
+                self.gas_slpm_output.set("Error: Tag not found")
+                return
+            
+            # Get recent data
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=2)
+            
+            df = self.db_handler.getDataframeBetween(start_time, end_time, [flow_tag_id])
+            if df is None or df.empty:
+                self.gas_slpm_output.set("Error: No data from database")
+                return
+            
+            if flow_tag not in df.columns:
+                self.gas_slpm_output.set("Error: Tag column not found")
+                return
+            
+            gas_lpm = df[flow_tag].dropna().iloc[-1] if not df[flow_tag].dropna().empty else None
+            if gas_lpm is None:
+                self.gas_slpm_output.set("Error: No valid value")
+                return
+            
+            # Update display
+            self.gas_lpm_db.set(f"{gas_lpm:.2f} LPM")
+            
+            # Store data point for plotting
+            now = datetime.now()
+            with self.update_lock:
+                if gas == "CO2":
+                    self.co2_flow_history.append((now, gas_lpm))
+                elif gas == "N2":
+                    self.n2_flow_history.append((now, gas_lpm))
+                elif gas == "H2":
+                    self.h2_flow_history.append((now, gas_lpm))
+            # Update plot
+            self.update_flow_plot()
+            
+            # Get temperature (from database or manual)
+            if self.use_db_conv.get() and self.db_available:
+                temp_c, _, _, _ = self.fetch_temp_pressure_from_db()
+                if temp_c is None:
+                    self.gas_slpm_output.set("Error: Could not fetch temperature from database")
+                    return
+            else:
+                temp_c = float(self.temp_manual.get())
+            
+            # Get pressure (from database or manual)
+            if self.use_db_conv.get() and self.db_available:
+                _, _, pressure_bar_gauge, _ = self.fetch_temp_pressure_from_db()
+                if pressure_bar_gauge is None:
+                    self.gas_slpm_output.set("Error: Could not fetch pressure from database")
+                    return
+            else:
+                pressure_bar_gauge = float(self.pressure_manual.get())
+            
+            # STP conditions: 20°C, 0 bar gauge
+            T_STP_K = 20.0 + 273.15  # 293.15 K
+            P_STP_bar_abs = 1.01325  # 1 atm = 1.01325 bar absolute
+            
+            # Actual conditions
+            T_actual_K = temp_c + 273.15
+            P_actual_bar_abs = pressure_bar_gauge + 1.01325  # Convert gauge to absolute
+            
+            # Convert from LPM at actual to SLPM: V_STP = V_actual * (P_actual / P_STP) * (T_STP / T_actual)
+            gas_slpm = gas_lpm * (P_actual_bar_abs / P_STP_bar_abs) * (T_STP_K / T_actual_K)
+            
+            self.gas_slpm_output.set(f"{gas_slpm:.2f} SLPM")
+            
+        except Exception as e:
+            self.gas_slpm_output.set(f"Error: {str(e)}")
+    
+    def update_flow_plot(self):
+        """Update the flow rate plot for the selected gas - fetches from database"""
+        gas = self.selected_gas.get()
+        _, _, _, gas_name = self.get_gas_tags(gas)
+        flow_tag_id = self.get_gas_flow_tag_id(gas)
+        
+        # Clear and redraw plot
+        self.flow_ax.clear()
+        
+        # Check if flow tag is available
+        if flow_tag_id is None:
+            # Show warning message for N2 (or other gases without flow tags)
+            if gas == "N2":
+                self.flow_ax.text(0.5, 0.5, "N2 LPM flow not retrievable!", 
+                                 transform=self.flow_ax.transAxes,
+                                 fontsize=14, ha='center', va='center',
+                                 color='red', weight='bold')
+            else:
+                self.flow_ax.text(0.5, 0.5, f"{gas_name} flow rate not available", 
+                                 transform=self.flow_ax.transAxes,
+                                 fontsize=12, ha='center', va='center',
+                                 color='orange')
+        # Fetch data from database
+        elif self.db_available:
+            try:
+                end_time = datetime.now()
+                
+                # Calculate start time based on user selection
+                if self.flow_time_range_mode.get() == "last":
+                    try:
+                        time_value = float(self.flow_time_value.get())
+                        time_unit = self.flow_time_unit.get()
+                        if time_unit == "seconds":
+                            start_time = end_time - timedelta(seconds=time_value)
+                        elif time_unit == "minutes":
+                            start_time = end_time - timedelta(minutes=time_value)
+                        elif time_unit == "hours":
+                            start_time = end_time - timedelta(hours=time_value)
+                        else:
+                            start_time = end_time - timedelta(minutes=5)  # Default
+                    except ValueError:
+                        start_time = end_time - timedelta(minutes=5)  # Default if invalid
+                else:
+                    start_time = end_time - timedelta(minutes=5)  # Default
+                
+                df = self.db_handler.getDataframeBetween(start_time, end_time, [flow_tag_id])
+                if df is not None and not df.empty:
+                    # The database handler maps tag IDs to tag names, so columns are named with tag names
+                    # We need to find the tag name that corresponds to this tag ID
+                    # tag_id_dict structure is {tag_id: tag_name}
+                    tag_name = None
+                    if hasattr(self, 'tag_id_dict') and self.tag_id_dict:
+                        # Direct lookup: tag_id_dict[tag_id] should give us the tag name
+                        if flow_tag_id in self.tag_id_dict:
+                            tag_name = self.tag_id_dict[flow_tag_id]
+                    
+                    flow_col = None
+                    # First try to find the tag name in columns
+                    if tag_name and tag_name in df.columns:
+                        flow_col = tag_name
+                    else:
+                        # If tag name not found, try getting it directly from the handler's dictionary
+                        if hasattr(self.db_handler, 'getTagIDDictionary'):
+                            tag_dict = self.db_handler.getTagIDDictionary()
+                            if tag_dict and flow_tag_id in tag_dict:
+                                handler_tag_name = tag_dict[flow_tag_id]
+                                if handler_tag_name in df.columns:
+                                    flow_col = handler_tag_name
+                        
+                        # Fallback: try tag ID as string or number
+                        if flow_col is None:
+                            tag_id_str = str(flow_tag_id)
+                            if tag_id_str in df.columns:
+                                flow_col = tag_id_str
+                            elif flow_tag_id in df.columns:
+                                flow_col = flow_tag_id
+                    
+                    if flow_col and flow_col in df.columns:
+                        # Get non-null values
+                        flow_series = df[flow_col].dropna()
+                        if not flow_series.empty:
+                            # Get timestamps - database handler returns 'DateTime' column
+                            datetime_col = 'DateTime' if 'DateTime' in df.columns else 'datetime'
+                            if datetime_col in df.columns:
+                                times = []
+                                values = []
+                                for idx in flow_series.index:
+                                    timestamp = df.loc[idx, datetime_col]
+                                    try:
+                                        from pandas import Timestamp
+                                        if isinstance(timestamp, Timestamp):
+                                            timestamp = timestamp.to_pydatetime()
+                                    except:
+                                        pass
+                                    if hasattr(timestamp, 'to_pydatetime'):
+                                        timestamp = timestamp.to_pydatetime()
+                                    times.append(timestamp)
+                                    values.append(flow_series.loc[idx])
+                                
+                                if times and values:
+                                    self.flow_ax.plot(times, values, 'b-', linewidth=1.5, label=f'{gas_name} Flow Rate')
+                                    self.flow_ax.legend(fontsize=8)
+                                    if len(values) > 1:
+                                        self.flow_ax.set_ylim(min(values) * 0.95, max(values) * 1.05)
+                                    else:
+                                        self.flow_ax.set_ylim(values[0] * 0.95, values[0] * 1.05)
+                                    self.flow_ax.set_xlim(start_time, end_time)
+                            else:
+                                print(f"Warning: No datetime column found in dataframe. Columns: {df.columns.tolist()}")
+                        else:
+                            print(f"Warning: No non-null values found for tag ID {flow_tag_id}")
+                    else:
+                        print(f"Warning: Tag ID {flow_tag_id} not found in dataframe columns: {df.columns.tolist()}")
+                else:
+                    if df is None or df.empty:
+                        print(f"Warning: No data returned from database for tag ID {flow_tag_id}")
+            except Exception as e:
+                print(f"Error updating flow plot: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        self.flow_ax.set_xlabel("Time", fontsize=9)
+        self.flow_ax.set_ylabel(f"{gas_name} Flow Rate (LPM)", fontsize=9)
+        self.flow_ax.grid(True, alpha=0.3)
+        self.flow_fig.tight_layout()
+        self.flow_canvas.draw()
+    
     def calculate(self):
         """Calculate and display power required"""
         try:
@@ -1474,7 +2167,8 @@ class PowerCalculatorGUI:
             if not self.live_update_active:
                 now = datetime.now()
                 with self.update_lock:
-                    self.power_history.append((now, total_power, power_plus_25))
+                    # Store: (datetime, base_power_without_heat_loss, total_power, power_plus_25)
+                    self.power_history.append((now, power, total_power, power_plus_25))
                     self.temp_history.append((now, side1_temp, side2_temp))
                 # Update plots
                 self.update_plots()
